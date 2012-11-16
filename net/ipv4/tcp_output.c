@@ -1135,6 +1135,14 @@ void __pskb_trim_head(struct sk_buff *skb, int len)
 {
 	int i, k, eat;
 
+	eat = min_t(int, len, skb_headlen(skb));
+	if (eat) {
+		__skb_pull(skb, eat);
+		skb->avail_size -= eat;
+		len -= eat;
+		if (!len)
+			return;
+	}
 	eat = len;
 	k = 0;
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
@@ -1166,11 +1174,7 @@ int tcp_trim_head(struct sock *sk, struct sk_buff *skb, u32 len)
 	if (skb_cloned(skb) && pskb_expand_head(skb, 0, 0, GFP_ATOMIC))
 		return -ENOMEM;
 
-	/* If len == headlen, we avoid __skb_pull to preserve alignment. */
-	if (unlikely(len < skb_headlen(skb)))
-		__skb_pull(skb, len);
-	else
-		__pskb_trim_head(skb, len - skb_headlen(skb));
+	__pskb_trim_head(skb, len);
 
 	TCP_SKB_CB(skb)->seq += len;
 	skb->ip_summed = CHECKSUM_PARTIAL;
@@ -1180,11 +1184,9 @@ int tcp_trim_head(struct sock *sk, struct sk_buff *skb, u32 len)
 	sk_mem_uncharge(sk, len);
 	sock_set_flag(sk, SOCK_QUEUE_SHRUNK);
 
-	/* Any change of skb->len requires recalculation of tso
-	 * factor and mss.
-	 */
+	/* Any change of skb->len requires recalculation of tso factor. */
 	if (tcp_skb_pcount(skb) > 1)
-		tcp_set_skb_tso_segs(sk, skb, tcp_current_mss(sk));
+		tcp_set_skb_tso_segs(sk, skb, tcp_skb_mss(skb));
 
 	return 0;
 }
@@ -2119,7 +2121,7 @@ static void tcp_retrans_try_collapse(struct sock *sk, struct sk_buff *to,
 		/* Punt if not enough space exists in the first SKB for
 		 * the data in the second
 		 */
-		if (skb->len > skb_tailroom(to))
+		if (skb->len > skb_availroom(to))
 			break;
 
 		if (after(TCP_SKB_CB(skb)->end_seq, tcp_wnd_end(tp)))

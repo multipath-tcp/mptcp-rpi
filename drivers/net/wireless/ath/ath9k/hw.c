@@ -557,7 +557,7 @@ static int __ath9k_hw_init(struct ath_hw *ah)
 
 	if (ah->config.serialize_regmode == SER_REG_MODE_AUTO) {
 		if (ah->hw_version.macVersion == AR_SREV_VERSION_5416_PCI ||
-		    ((AR_SREV_9160(ah) || AR_SREV_9280(ah)) &&
+		    ((AR_SREV_9160(ah) || AR_SREV_9280(ah) || AR_SREV_9287(ah)) &&
 		     !ah->is_pciexpress)) {
 			ah->config.serialize_regmode =
 				SER_REG_MODE_ON;
@@ -718,12 +718,24 @@ static void ath9k_hw_init_qos(struct ath_hw *ah)
 
 u32 ar9003_get_pll_sqsum_dvc(struct ath_hw *ah)
 {
+	struct ath_common *common = ath9k_hw_common(ah);
+	int i = 0;
+
 	REG_CLR_BIT(ah, PLL3, PLL3_DO_MEAS_MASK);
 	udelay(100);
 	REG_SET_BIT(ah, PLL3, PLL3_DO_MEAS_MASK);
 
-	while ((REG_READ(ah, PLL4) & PLL4_MEAS_DONE) == 0)
+	while ((REG_READ(ah, PLL4) & PLL4_MEAS_DONE) == 0) {
+
 		udelay(100);
+
+		if (WARN_ON_ONCE(i >= 100)) {
+			ath_err(common, "PLL4 meaurement not done\n");
+			break;
+		}
+
+		i++;
+	}
 
 	return (REG_READ(ah, PLL3) & SQSUM_DVC_MASK) >> 3;
 }
@@ -1034,13 +1046,16 @@ void ath9k_hw_init_global_settings(struct ath_hw *ah)
 
 	/*
 	 * Workaround for early ACK timeouts, add an offset to match the
-	 * initval's 64us ack timeout value.
+	 * initval's 64us ack timeout value. Use 48us for the CTS timeout.
 	 * This was initially only meant to work around an issue with delayed
 	 * BA frames in some implementations, but it has been found to fix ACK
 	 * timeout issues in other cases as well.
 	 */
-	if (conf->channel && conf->channel->band == IEEE80211_BAND_2GHZ)
+	if (conf->channel && conf->channel->band == IEEE80211_BAND_2GHZ) {
 		acktimeout += 64 - sifstime - ah->slottime;
+		ctstimeout += 48 - sifstime - ah->slottime;
+	}
+
 
 	ath9k_hw_set_sifs_time(ah, sifstime);
 	ath9k_hw_setslottime(ah, slottime);

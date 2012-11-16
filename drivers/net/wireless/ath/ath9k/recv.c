@@ -824,6 +824,15 @@ static bool ath9k_rx_accept(struct ath_common *common,
 		(ATH9K_RXERR_DECRYPT | ATH9K_RXERR_CRC | ATH9K_RXERR_MIC |
 		 ATH9K_RXERR_KEYMISS));
 
+	/*
+	 * Key miss events are only relevant for pairwise keys where the
+	 * descriptor does contain a valid key index. This has been observed
+	 * mostly with CCMP encryption.
+	 */
+	if (rx_stats->rs_keyix == ATH9K_RXKEYIX_INVALID ||
+	    !test_bit(rx_stats->rs_keyix, common->ccmp_keymap))
+		rx_stats->rs_status &= ~ATH9K_RXERR_KEYMISS;
+
 	if (!rx_stats->rs_datalen)
 		return false;
         /*

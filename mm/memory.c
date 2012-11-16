@@ -1228,16 +1228,24 @@ static inline unsigned long zap_pmd_range(struct mmu_gather *tlb,
 	do {
 		next = pmd_addr_end(addr, end);
 		if (pmd_trans_huge(*pmd)) {
-			if (next-addr != HPAGE_PMD_SIZE) {
+			if (next - addr != HPAGE_PMD_SIZE) {
 				VM_BUG_ON(!rwsem_is_locked(&tlb->mm->mmap_sem));
 				split_huge_page_pmd(vma->vm_mm, pmd);
 			} else if (zap_huge_pmd(tlb, vma, pmd))
-				continue;
+				goto next;
 			/* fall through */
 		}
-		if (pmd_none_or_clear_bad(pmd))
-			continue;
+		/*
+		 * Here there can be other concurrent MADV_DONTNEED or
+		 * trans huge page faults running, and if the pmd is
+		 * none or trans huge it can change under us. This is
+		 * because MADV_DONTNEED holds the mmap_sem in read
+		 * mode.
+		 */
+		if (pmd_none_or_trans_huge_or_clear_bad(pmd))
+			goto next;
 		next = zap_pte_range(tlb, vma, pmd, addr, next, details);
+next:
 		cond_resched();
 	} while (pmd++, addr = next, addr != end);
 
@@ -1350,8 +1358,11 @@ unsigned long unmap_vmas(struct mmu_gather *tlb,
 				 * Since no pte has actually been setup, it is
 				 * safe to do nothing in this case.
 				 */
-				if (vma->vm_file)
-					unmap_hugepage_range(vma, start, end, NULL);
+				if (vma->vm_file) {
+					mutex_lock(&vma->vm_file->f_mapping->i_mmap_mutex);
+					__unmap_hugepage_range_final(vma, start, end, NULL);
+					mutex_unlock(&vma->vm_file->f_mapping->i_mmap_mutex);
+				}
 
 				start = end;
 			} else

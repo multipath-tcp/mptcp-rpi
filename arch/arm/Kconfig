@@ -520,7 +520,7 @@ config ARCH_IXP4XX
 	depends on MMU
 	select CLKSRC_MMIO
 	select CPU_XSCALE
-	select GENERIC_GPIO
+	select ARCH_REQUIRE_GPIOLIB
 	select GENERIC_CLOCKEVENTS
 	select HAVE_SCHED_CLOCK
 	select MIGHT_HAVE_PCI
@@ -955,6 +955,23 @@ config PLAT_SPEAR
 	help
 	  Support for ST's SPEAr platform (SPEAr3xx, SPEAr6xx and SPEAr13xx).
 
+config ARCH_BCM2708
+	bool "Broadcom BCM2708 family"
+	select CPU_V6
+	select ARM_AMBA
+	select HAVE_CLK
+	select HAVE_SCHED_CLOCK
+	select NEED_MACH_MEMORY_H
+	select CLKDEV_LOOKUP
+	select ARCH_HAS_CPUFREQ
+	select GENERIC_CLOCKEVENTS
+	select ARM_ERRATA_411920
+	select MACH_BCM2708
+	select VC4
+	select FIQ
+	help
+	  This enables support for Broadcom BCM2708 boards.
+
 config ARCH_VT8500
 	bool "VIA/WonderMedia 85xx"
 	select CPU_ARM926T
@@ -1098,6 +1115,7 @@ source "arch/arm/plat-versatile/Kconfig"
 source "arch/arm/mach-vt8500/Kconfig"
 
 source "arch/arm/mach-w90x900/Kconfig"
+source "arch/arm/mach-bcm2708/Kconfig"
 
 # Definitions to make life easier
 config ARCH_ACORN
@@ -1154,6 +1172,15 @@ config MULTI_IRQ_HANDLER
 if !MMU
 source "arch/arm/Kconfig-nommu"
 endif
+
+config ARM_ERRATA_326103
+	bool "ARM errata: FSR write bit incorrect on a SWP to read-only memory"
+	depends on CPU_V6
+	help
+	  Executing a SWP instruction to read-only memory does not set bit 11
+	  of the FSR on the ARM 1136 prior to r1p0. This causes the kernel to
+	  treat the access as a read, preventing a COW from occurring and
+	  causing the faulting task to livelock.
 
 config ARM_ERRATA_411920
 	bool "ARM errata: Invalidation of the Instruction Cache operation can fail"
@@ -1272,7 +1299,7 @@ config ARM_ERRATA_743622
 	depends on CPU_V7
 	help
 	  This option enables the workaround for the 743622 Cortex-A9
-	  (r2p0..r2p2) erratum. Under very rare conditions, a faulty
+	  (r2p*) erratum. Under very rare conditions, a faulty
 	  optimisation in the Cortex-A9 Store Buffer may lead to data
 	  corruption. This workaround sets a specific bit in the diagnostic
 	  register of the Cortex-A9 which disables the Store Buffer

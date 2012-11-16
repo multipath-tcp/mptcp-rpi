@@ -93,6 +93,7 @@ struct sdhci_host {
 #define SDHCI_QUIRK2_OWN_CARD_DETECTION			(1<<0)
 
 	int irq;		/* Device IRQ */
+	int second_irq; 	/* Additional IRQ to disable/enable in low-latency mode */
 	void __iomem *ioaddr;	/* Mapped address */
 
 	const struct sdhci_ops *ops;	/* Low level hw interface */
@@ -121,6 +122,7 @@ struct sdhci_host {
 #define SDHCI_AUTO_CMD23	(1<<7)	/* Auto CMD23 support */
 #define SDHCI_PV_ENABLED	(1<<8)	/* Preset value enabled */
 #define SDHCI_SDIO_IRQ_ENABLED	(1<<9)	/* SDIO irq enabled */
+#define SDHCI_USE_PLATDMA       (1<<10) /* Host uses 3rd party DMA */
 
 	unsigned int version;	/* SDHCI spec. version */
 
@@ -135,6 +137,7 @@ struct sdhci_host {
 
 	struct mmc_request *mrq;	/* Current request */
 	struct mmc_command *cmd;	/* Current command */
+	int	last_cmdop;	/* Opcode of last cmd sent */
 	struct mmc_data *data;	/* Current data request */
 	unsigned int data_early:1;	/* Data finished before cmd */
 

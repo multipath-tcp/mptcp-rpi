@@ -2341,8 +2341,7 @@ static int copy_and_check(struct load_info *info,
 		return -ENOEXEC;
 
 	/* Suck in entire file: we'll want most of it. */
-	/* vmalloc barfs on "unusual" numbers.  Check here */
-	if (len > 64 * 1024 * 1024 || (hdr = vmalloc(len)) == NULL)
+	if ((hdr = vmalloc(len)) == NULL)
 		return -ENOMEM;
 
 	if (copy_from_user(hdr, umod, len) != 0) {
@@ -2605,20 +2604,23 @@ static int move_module(struct module *mod, struct load_info *info)
 	memset(ptr, 0, mod->core_size);
 	mod->module_core = ptr;
 
-	ptr = module_alloc_update_bounds(mod->init_size);
-	/*
-	 * The pointer to this block is stored in the module structure
-	 * which is inside the block. This block doesn't need to be
-	 * scanned as it contains data and code that will be freed
-	 * after the module is initialized.
-	 */
-	kmemleak_ignore(ptr);
-	if (!ptr && mod->init_size) {
-		module_free(mod, mod->module_core);
-		return -ENOMEM;
+	if (mod->init_size) {
+		ptr = module_alloc_update_bounds(mod->init_size);
+		/*
+		 * The pointer to this block is stored in the module structure
+		 * which is inside the block. This block doesn't need to be
+		 * scanned as it contains data and code that will be freed
+		 * after the module is initialized.
+		 */
+		kmemleak_ignore(ptr);
+		if (!ptr && mod->init_size) {
+			module_free(mod, mod->module_core);
+			return -ENOMEM;
+		}
+		memset(ptr, 0, mod->init_size);
+		mod->module_init = ptr;
 	}
-	memset(ptr, 0, mod->init_size);
-	mod->module_init = ptr;
+	else mod->module_init = NULL;
 
 	/* Transfer each section which specifies SHF_ALLOC */
 	DEBUGP("final section addresses:\n");

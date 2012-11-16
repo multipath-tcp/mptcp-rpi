@@ -552,6 +552,12 @@ config USB_GADGET_SUPERSPEED
 	depends on USB_GADGET
 	depends on USB_GADGET_DUALSPEED
 
+config USB_DWC_OTG_LPM
+	boolean "Enable LPM support"
+	depends on USB && EXPERIMENTAL
+	help
+	   Enables LPM support.
+
 #
 # USB Gadget Drivers
 #

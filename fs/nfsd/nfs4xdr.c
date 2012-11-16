@@ -2236,7 +2236,7 @@ out_acl:
 	if (bmval0 & FATTR4_WORD0_CASE_INSENSITIVE) {
 		if ((buflen -= 4) < 0)
 			goto out_resource;
-		WRITE32(1);
+		WRITE32(0);
 	}
 	if (bmval0 & FATTR4_WORD0_CASE_PRESERVING) {
 		if ((buflen -= 4) < 0)
@@ -3411,7 +3411,7 @@ nfsd4_encode_test_stateid(struct nfsd4_compoundres *resp, int nfserr,
 		nfsd4_decode_stateid(argp, &si);
 		valid = nfs4_validate_stateid(cl, &si);
 		RESERVE_SPACE(4);
-		*p++ = htonl(valid);
+		*p++ = valid;
 		resp->p = p;
 	}
 	nfs4_unlock_state();

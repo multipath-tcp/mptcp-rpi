@@ -277,6 +277,15 @@ void ext4_da_update_reserve_space(struct inode *inode,
 		used = ei->i_reserved_data_blocks;
 	}
 
+	if (unlikely(ei->i_allocated_meta_blocks > ei->i_reserved_meta_blocks)) {
+		ext4_msg(inode->i_sb, KERN_NOTICE, "%s: ino %lu, allocated %d "
+			 "with only %d reserved metadata blocks\n", __func__,
+			 inode->i_ino, ei->i_allocated_meta_blocks,
+			 ei->i_reserved_meta_blocks);
+		WARN_ON(1);
+		ei->i_allocated_meta_blocks = ei->i_reserved_meta_blocks;
+	}
+
 	/* Update per-inode reservations */
 	ei->i_reserved_data_blocks -= used;
 	ei->i_reserved_meta_blocks -= ei->i_allocated_meta_blocks;
@@ -1102,18 +1111,8 @@ static int ext4_da_reserve_space(struct inode *inode, ext4_lblk_t lblock)
 	struct ext4_inode_info *ei = EXT4_I(inode);
 	unsigned int md_needed;
 	int ret;
-
-	/*
-	 * recalculate the amount of metadata blocks to reserve
-	 * in order to allocate nrblocks
-	 * worse case is one extent per block
-	 */
-repeat:
-	spin_lock(&ei->i_block_reservation_lock);
-	md_needed = EXT4_NUM_B2C(sbi,
-				 ext4_calc_metadata_amount(inode, lblock));
-	trace_ext4_da_reserve_space(inode, md_needed);
-	spin_unlock(&ei->i_block_reservation_lock);
+	ext4_lblk_t save_last_lblock;
+	int save_len;
 
 	/*
 	 * We will charge metadata quota at writeout time; this saves
@@ -1123,19 +1122,39 @@ repeat:
 	ret = dquot_reserve_block(inode, EXT4_C2B(sbi, 1));
 	if (ret)
 		return ret;
+
+	/*
+	 * recalculate the amount of metadata blocks to reserve
+	 * in order to allocate nrblocks
+	 * worse case is one extent per block
+	 */
+repeat:
+	spin_lock(&ei->i_block_reservation_lock);
+	/*
+	 * ext4_calc_metadata_amount() has side effects, which we have
+	 * to be prepared undo if we fail to claim space.
+	 */
+	save_len = ei->i_da_metadata_calc_len;
+	save_last_lblock = ei->i_da_metadata_calc_last_lblock;
+	md_needed = EXT4_NUM_B2C(sbi,
+				 ext4_calc_metadata_amount(inode, lblock));
+	trace_ext4_da_reserve_space(inode, md_needed);
+
 	/*
 	 * We do still charge estimated metadata to the sb though;
 	 * we cannot afford to run out of free blocks.
 	 */
 	if (ext4_claim_free_clusters(sbi, md_needed + 1, 0)) {
-		dquot_release_reservation_block(inode, EXT4_C2B(sbi, 1));
+		ei->i_da_metadata_calc_len = save_len;
+		ei->i_da_metadata_calc_last_lblock = save_last_lblock;
+		spin_unlock(&ei->i_block_reservation_lock);
 		if (ext4_should_retry_alloc(inode->i_sb, &retries)) {
 			yield();
 			goto repeat;
 		}
+		dquot_release_reservation_block(inode, EXT4_C2B(sbi, 1));
 		return -ENOSPC;
 	}
-	spin_lock(&ei->i_block_reservation_lock);
 	ei->i_reserved_data_blocks++;
 	ei->i_reserved_meta_blocks += md_needed;
 	spin_unlock(&ei->i_block_reservation_lock);
@@ -2480,13 +2499,14 @@ static int ext4_da_write_end(struct file *file,
 	int write_mode = (int)(unsigned long)fsdata;
 
 	if (write_mode == FALL_BACK_TO_NONDELALLOC) {
-		if (ext4_should_order_data(inode)) {
+		switch (ext4_inode_journal_mode(inode)) {
+		case EXT4_INODE_ORDERED_DATA_MODE:
 			return ext4_ordered_write_end(file, mapping, pos,
 					len, copied, page, fsdata);
-		} else if (ext4_should_writeback_data(inode)) {
+		case EXT4_INODE_WRITEBACK_DATA_MODE:
 			return ext4_writeback_write_end(file, mapping, pos,
 					len, copied, page, fsdata);
-		} else {
+		default:
 			BUG();
 		}
 	}
@@ -2793,9 +2813,6 @@ out:
 
 	/* queue the work to convert unwritten extents to written */
 	queue_work(wq, &io_end->work);
-
-	/* XXX: probably should move into the real I/O completion handler */
-	inode_dio_done(inode);
 }
 
 static void ext4_end_io_buffer_write(struct buffer_head *bh, int uptodate)
@@ -2919,9 +2936,12 @@ static ssize_t ext4_ext_direct_IO(int rw, struct kiocb *iocb,
 		iocb->private = NULL;
 		EXT4_I(inode)->cur_aio_dio = NULL;
 		if (!is_sync_kiocb(iocb)) {
-			iocb->private = ext4_init_io_end(inode, GFP_NOFS);
-			if (!iocb->private)
+			ext4_io_end_t *io_end =
+				ext4_init_io_end(inode, GFP_NOFS);
+			if (!io_end)
 				return -ENOMEM;
+			io_end->flag |= EXT4_IO_END_DIRECT;
+			iocb->private = io_end;
 			/*
 			 * we save the io structure for current async
 			 * direct IO, so that later ext4_map_blocks()
@@ -3084,18 +3104,25 @@ static const struct address_space_operations ext4_da_aops = {
 
 void ext4_set_aops(struct inode *inode)
 {
-	if (ext4_should_order_data(inode) &&
-		test_opt(inode->i_sb, DELALLOC))
-		inode->i_mapping->a_ops = &ext4_da_aops;
-	else if (ext4_should_order_data(inode))
-		inode->i_mapping->a_ops = &ext4_ordered_aops;
-	else if (ext4_should_writeback_data(inode) &&
-		 test_opt(inode->i_sb, DELALLOC))
-		inode->i_mapping->a_ops = &ext4_da_aops;
-	else if (ext4_should_writeback_data(inode))
-		inode->i_mapping->a_ops = &ext4_writeback_aops;
-	else
+	switch (ext4_inode_journal_mode(inode)) {
+	case EXT4_INODE_ORDERED_DATA_MODE:
+		if (test_opt(inode->i_sb, DELALLOC))
+			inode->i_mapping->a_ops = &ext4_da_aops;
+		else
+			inode->i_mapping->a_ops = &ext4_ordered_aops;
+		break;
+	case EXT4_INODE_WRITEBACK_DATA_MODE:
+		if (test_opt(inode->i_sb, DELALLOC))
+			inode->i_mapping->a_ops = &ext4_da_aops;
+		else
+			inode->i_mapping->a_ops = &ext4_writeback_aops;
+		break;
+	case EXT4_INODE_JOURNAL_DATA_MODE:
 		inode->i_mapping->a_ops = &ext4_journalled_aops;
+		break;
+	default:
+		BUG();
+	}
 }
 
 

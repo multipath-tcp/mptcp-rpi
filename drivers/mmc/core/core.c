@@ -514,10 +514,14 @@ void mmc_set_data_timeout(struct mmc_data *data, const struct mmc_card *card)
 
 		if (data->flags & MMC_DATA_WRITE)
 			/*
-			 * The limit is really 250 ms, but that is
-			 * insufficient for some crappy cards.
+			 * The MMC spec "It is strongly recommended
+			 * for hosts to implement more than 500ms
+			 * timeout value even if the card indicates
+			 * the 250ms maximum busy length."  Even the
+			 * previous value of 300ms is known to be
+			 * insufficient for some cards.
 			 */
-			limit_us = 300000;
+			limit_us = 3000000;
 		else
 			limit_us = 100000;
 
@@ -1516,7 +1520,10 @@ static unsigned int mmc_mmc_erase_timeout(struct mmc_card *card,
 {
 	unsigned int erase_timeout;
 
-	if (card->ext_csd.erase_group_def & 1) {
+	if (arg == MMC_DISCARD_ARG ||
+	    (arg == MMC_TRIM_ARG && card->ext_csd.rev >= 6)) {
+		erase_timeout = card->ext_csd.trim_timeout;
+	} else if (card->ext_csd.erase_group_def & 1) {
 		/* High Capacity Erase Group Size uses HC timeouts */
 		if (arg == MMC_TRIM_ARG)
 			erase_timeout = card->ext_csd.trim_timeout;
@@ -1788,8 +1795,6 @@ int mmc_can_trim(struct mmc_card *card)
 {
 	if (card->ext_csd.sec_feature_support & EXT_CSD_SEC_GB_CL_EN)
 		return 1;
-	if (mmc_can_discard(card))
-		return 1;
 	return 0;
 }
 EXPORT_SYMBOL(mmc_can_trim);
@@ -1808,6 +1813,8 @@ EXPORT_SYMBOL(mmc_can_discard);
 
 int mmc_can_sanitize(struct mmc_card *card)
 {
+	if (!mmc_can_trim(card) && !mmc_can_erase(card))
+		return 0;
 	if (card->ext_csd.sec_feature_support & EXT_CSD_SEC_SANITIZE)
 		return 1;
 	return 0;

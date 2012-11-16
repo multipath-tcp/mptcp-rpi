@@ -427,19 +427,8 @@ int iscsit_reset_np_thread(
 
 int iscsit_del_np_comm(struct iscsi_np *np)
 {
-	if (!np->np_socket)
-		return 0;
-
-	/*
-	 * Some network transports allocate their own struct sock->file,
-	 * see  if we need to free any additional allocated resources.
-	 */
-	if (np->np_flags & NPF_SCTP_STRUCT_FILE) {
-		kfree(np->np_socket->file);
-		np->np_socket->file = NULL;
-	}
-
-	sock_release(np->np_socket);
+	if (np->np_socket)
+		sock_release(np->np_socket);
 	return 0;
 }
 
@@ -781,7 +770,7 @@ static int iscsit_alloc_buffs(struct iscsi_cmd *cmd)
 	struct scatterlist *sgl;
 	u32 length = cmd->se_cmd.data_length;
 	int nents = DIV_ROUND_UP(length, PAGE_SIZE);
-	int i = 0, ret;
+	int i = 0, j = 0, ret;
 	/*
 	 * If no SCSI payload is present, allocate the default iovecs used for
 	 * iSCSI PDU Header
@@ -822,17 +811,15 @@ static int iscsit_alloc_buffs(struct iscsi_cmd *cmd)
 	 */
         ret = iscsit_allocate_iovecs(cmd);
         if (ret < 0)
-		goto page_alloc_failed;
+		return -ENOMEM;
 
 	return 0;
 
 page_alloc_failed:
-	while (i >= 0) {
-		__free_page(sg_page(&sgl[i]));
-		i--;
-	}
-	kfree(cmd->t_mem_sg);
-	cmd->t_mem_sg = NULL;
+	while (j < i)
+		__free_page(sg_page(&sgl[j++]));
+
+	kfree(sgl);
 	return -ENOMEM;
 }
 
@@ -1029,7 +1016,7 @@ done:
 		return iscsit_add_reject_from_cmd(
 				ISCSI_REASON_BOOKMARK_NO_RESOURCES,
 				1, 1, buf, cmd);
-	} else if (transport_ret == -EINVAL) {
+	} else if (transport_ret < 0) {
 		/*
 		 * Unsupported SAM Opcode.  CHECK_CONDITION will be sent
 		 * in iscsit_execute_cmd() during the CmdSN OOO Execution
@@ -1062,7 +1049,7 @@ attach_cmd:
 	if (ret < 0)
 		return iscsit_add_reject_from_cmd(
 				ISCSI_REASON_BOOKMARK_NO_RESOURCES,
-				1, 1, buf, cmd);
+				1, 0, buf, cmd);
 	/*
 	 * Check the CmdSN against ExpCmdSN/MaxCmdSN here if
 	 * the Immediate Bit is not set, and no Immediate
@@ -3165,6 +3152,30 @@ static int iscsit_send_task_mgt_rsp(
 	return 0;
 }
 
+static bool iscsit_check_inaddr_any(struct iscsi_np *np)
+{
+	bool ret = false;
+
+	if (np->np_sockaddr.ss_family == AF_INET6) {
+		const struct sockaddr_in6 sin6 = {
+			.sin6_addr = IN6ADDR_ANY_INIT };
+		struct sockaddr_in6 *sock_in6 =
+			 (struct sockaddr_in6 *)&np->np_sockaddr;
+
+		if (!memcmp(sock_in6->sin6_addr.s6_addr,
+				sin6.sin6_addr.s6_addr, 16))
+			ret = true;
+	} else {
+		struct sockaddr_in * sock_in =
+			(struct sockaddr_in *)&np->np_sockaddr;
+
+		if (sock_in->sin_addr.s_addr == INADDR_ANY)
+			ret = true;
+	}
+
+	return ret;
+}
+
 static int iscsit_build_sendtargets_response(struct iscsi_cmd *cmd)
 {
 	char *payload = NULL;
@@ -3214,12 +3225,17 @@ static int iscsit_build_sendtargets_response(struct iscsi_cmd *cmd)
 			spin_lock(&tpg->tpg_np_lock);
 			list_for_each_entry(tpg_np, &tpg->tpg_gnp_list,
 						tpg_np_list) {
+				struct iscsi_np *np = tpg_np->tpg_np;
+				bool inaddr_any = iscsit_check_inaddr_any(np);
+
 				len = sprintf(buf, "TargetAddress="
 					"%s%s%s:%hu,%hu",
-					(tpg_np->tpg_np->np_sockaddr.ss_family == AF_INET6) ?
-					"[" : "", tpg_np->tpg_np->np_ip,
-					(tpg_np->tpg_np->np_sockaddr.ss_family == AF_INET6) ?
-					"]" : "", tpg_np->tpg_np->np_port,
+					(np->np_sockaddr.ss_family == AF_INET6) ?
+					"[" : "", (inaddr_any == false) ?
+						np->np_ip : conn->local_ip,
+					(np->np_sockaddr.ss_family == AF_INET6) ?
+					"]" : "", (inaddr_any == false) ?
+						np->np_port : conn->local_port,
 					tpg->tpgt);
 				len += 1;
 
@@ -4078,13 +4094,8 @@ int iscsit_close_connection(
 	kfree(conn->conn_ops);
 	conn->conn_ops = NULL;
 
-	if (conn->sock) {
-		if (conn->conn_flags & CONNFLAG_SCTP_STRUCT_FILE) {
-			kfree(conn->sock->file);
-			conn->sock->file = NULL;
-		}
+	if (conn->sock)
 		sock_release(conn->sock);
-	}
 	conn->thread_set = NULL;
 
 	pr_debug("Moving to TARG_CONN_STATE_FREE.\n");

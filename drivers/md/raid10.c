@@ -790,9 +790,22 @@ static void wait_barrier(struct r10conf *conf)
 	spin_lock_irq(&conf->resync_lock);
 	if (conf->barrier) {
 		conf->nr_waiting++;
-		wait_event_lock_irq(conf->wait_barrier, !conf->barrier,
+		/* Wait for the barrier to drop.
+		 * However if there are already pending
+		 * requests (preventing the barrier from
+		 * rising completely), and the
+		 * pre-process bio queue isn't empty,
+		 * then don't wait, as we need to empty
+		 * that queue to get the nr_pending
+		 * count down.
+		 */
+		wait_event_lock_irq(conf->wait_barrier,
+				    !conf->barrier ||
+				    (conf->nr_pending &&
+				     current->bio_list &&
+				     !bio_list_empty(current->bio_list)),
 				    conf->resync_lock,
-				    );
+			);
 		conf->nr_waiting--;
 	}
 	conf->nr_pending++;
@@ -1906,7 +1919,7 @@ static void fix_read_error(struct r10conf *conf, struct mddev *mddev, struct r10
 			if (r10_sync_page_io(rdev,
 					     r10_bio->devs[sl].addr +
 					     sect,
-					     s<<9, conf->tmppage, WRITE)
+					     s, conf->tmppage, WRITE)
 			    == 0) {
 				/* Well, this device is dead */
 				printk(KERN_NOTICE
@@ -1943,7 +1956,7 @@ static void fix_read_error(struct r10conf *conf, struct mddev *mddev, struct r10
 			switch (r10_sync_page_io(rdev,
 					     r10_bio->devs[sl].addr +
 					     sect,
-					     s<<9, conf->tmppage,
+					     s, conf->tmppage,
 						 READ)) {
 			case 0:
 				/* Well, this device is dead */
@@ -2106,7 +2119,7 @@ read_more:
 	rdev = conf->mirrors[mirror].rdev;
 	printk_ratelimited(
 		KERN_ERR
-		"md/raid10:%s: %s: redirecting"
+		"md/raid10:%s: %s: redirecting "
 		"sector %llu to another mirror\n",
 		mdname(mddev),
 		bdevname(rdev->bdev, b),
@@ -2423,6 +2436,12 @@ static sector_t sync_request(struct mddev *mddev, sector_t sector_nr,
 			/* want to reconstruct this device */
 			rb2 = r10_bio;
 			sect = raid10_find_virt(conf, sector_nr, i);
+			if (sect >= mddev->resync_max_sectors) {
+				/* last stripe is not complete - don't
+				 * try to recover this sector.
+				 */
+				continue;
+			}
 			/* Unless we are doing a full sync, we only need
 			 * to recover the block if it is set in the bitmap
 			 */

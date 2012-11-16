@@ -705,10 +705,26 @@ static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
 	if (type == HUB_INIT3)
 		goto init3;
 
-	/* After a resume, port power should still be on.
+	/* The superspeed hub except for root hub has to use Hub Depth
+	 * value as an offset into the route string to locate the bits
+	 * it uses to determine the downstream port number. So hub driver
+	 * should send a set hub depth request to superspeed hub after
+	 * the superspeed hub is set configuration in initialization or
+	 * reset procedure.
+	 *
+	 * After a resume, port power should still be on.
 	 * For any other type of activation, turn it on.
 	 */
 	if (type != HUB_RESUME) {
+		if (hdev->parent && hub_is_superspeed(hdev)) {
+			ret = usb_control_msg(hdev, usb_sndctrlpipe(hdev, 0),
+					HUB_SET_DEPTH, USB_RT_HUB,
+					hdev->level - 1, 0, NULL, 0,
+					USB_CTRL_SET_TIMEOUT);
+			if (ret < 0)
+				dev_err(hub->intfdev,
+						"set hub depth failed\n");
+		}
 
 		/* Speed up system boot by using a delayed_work for the
 		 * hub's initial power-up delays.  This is pretty awkward
@@ -987,18 +1003,6 @@ static int hub_configure(struct usb_hub *hub,
 		goto fail;
 	}
 
-	if (hub_is_superspeed(hdev) && (hdev->parent != NULL)) {
-		ret = usb_control_msg(hdev, usb_sndctrlpipe(hdev, 0),
-				HUB_SET_DEPTH, USB_RT_HUB,
-				hdev->level - 1, 0, NULL, 0,
-				USB_CTRL_SET_TIMEOUT);
-
-		if (ret < 0) {
-			message = "can't set hub depth";
-			goto fail;
-		}
-	}
-
 	/* Request the entire hub descriptor.
 	 * hub->descriptor can handle USB_MAXCHILDREN ports,
 	 * but the hub can/will return fewer bytes here.
@@ -1071,6 +1075,8 @@ static int hub_configure(struct usb_hub *hub,
 	INIT_WORK(&hub->tt.clear_work, hub_tt_work);
 	switch (hdev->descriptor.bDeviceProtocol) {
 		case 0:
+			dev_dbg(hub_dev, "TT with no hub-specific protocol - "
+				"no TT\n");
 			break;
 		case 1:
 			dev_dbg(hub_dev, "Single TT\n");
@@ -1087,6 +1093,7 @@ static int hub_configure(struct usb_hub *hub,
 			hub->tt.hub = hdev;
 			break;
 		case 3:
+			dev_dbg(hub_dev, "USB 3.0 hub - no TT\n");
 			/* USB 3.0 hubs don't have a TT */
 			break;
 		default:
@@ -1640,7 +1647,6 @@ void usb_disconnect(struct usb_device **pdev)
 {
 	struct usb_device	*udev = *pdev;
 	int			i;
-	struct usb_hcd		*hcd = bus_to_hcd(udev->bus);
 
 	/* mark the device as inactive, so any further urb submissions for
 	 * this device (and any of its children) will fail immediately.
@@ -1663,9 +1669,7 @@ void usb_disconnect(struct usb_device **pdev)
 	 * so that the hardware is now fully quiesced.
 	 */
 	dev_dbg (&udev->dev, "unregistering device\n");
-	mutex_lock(hcd->bandwidth_mutex);
 	usb_disable_device(udev, 0);
-	mutex_unlock(hcd->bandwidth_mutex);
 	usb_hcd_synchronize_unlinks(udev);
 
 	usb_remove_ep_devs(&udev->ep0);
@@ -1719,6 +1723,12 @@ static inline void announce_device(struct usb_device *udev) { }
 #endif
 
 #ifdef	CONFIG_USB_OTG
+
+static int enable_whitelist;
+module_param(enable_whitelist, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(enable_whitelist,
+		 "only recognize devices in OTG whitelist if true");
+
 #include "otg_whitelist.h"
 #endif
 
@@ -1773,9 +1783,15 @@ static int usb_enumerate_device_otg(struct usb_device *udev)
 					dev_info(&udev->dev,
 						"can't set HNP mode: %d\n",
 						err);
+					dev_printk(KERN_CRIT, &udev->dev,
+						"Not Connected/Responding\n");
+
 					bus->b_hnp_enable = 0;
+				} else {
+					dev_info(&udev->dev,
+						"HNP Not Supported\n");
 				}
-			}
+                        }
 		}
 	}
 
@@ -1784,12 +1800,27 @@ static int usb_enumerate_device_otg(struct usb_device *udev)
 		/* Maybe it can talk to us, though we can't talk to it.
 		 * (Includes HNP test device.)
 		 */
-		if (udev->bus->b_hnp_enable || udev->bus->is_b_host) {
+		if (udev->bus->b_hnp_enable || udev->bus->is_b_host ||
+		    udev->descriptor.idVendor == 0x1a0a) {
 			err = usb_port_suspend(udev, PMSG_SUSPEND);
-			if (err < 0)
+			if (err < 0) {
 				dev_dbg(&udev->dev, "HNP fail, %d\n", err);
+			} else {
+			    /* Return Connection Refused(ECONNREFUSED)
+			     * instead of No Device(ENODEV) so that the
+			     * retry loop in hub_port_connect_change() is
+			     * exited without disabling the port
+			     */
+			    err = -ECONNREFUSED;
+			    goto fail;
+			}
 		}
-		err = -ENOTSUPP;
+		//err = -ENOTSUPP;
+		/* Return Not Connected (ENOTCONN) instead of No
+		 * Device(ENODEV) so that the retry loop in
+		 * hub_port_connect_change() is exited
+		 */
+		err = -ENOTCONN;
 		goto fail;
 	}
 fail:
@@ -2038,12 +2069,16 @@ static unsigned hub_is_wusb(struct usb_hub *hub)
 static int hub_port_reset(struct usb_hub *hub, int port1,
 			struct usb_device *udev, unsigned int delay, bool warm);
 
-/* Is a USB 3.0 port in the Inactive state? */
-static bool hub_port_inactive(struct usb_hub *hub, u16 portstatus)
+/* Is a USB 3.0 port in the Inactive or Complinance Mode state?
+ * Port worm reset is required to recover
+ */
+static bool hub_port_warm_reset_required(struct usb_hub *hub, u16 portstatus)
 {
 	return hub_is_superspeed(hub->hdev) &&
-		(portstatus & USB_PORT_STAT_LINK_STATE) ==
-		USB_SS_PORT_LS_SS_INACTIVE;
+		(((portstatus & USB_PORT_STAT_LINK_STATE) ==
+		  USB_SS_PORT_LS_SS_INACTIVE) ||
+		 ((portstatus & USB_PORT_STAT_LINK_STATE) ==
+		  USB_SS_PORT_LS_COMP_MOD)) ;
 }
 
 static int hub_port_wait_reset(struct usb_hub *hub, int port1,
@@ -2079,7 +2114,7 @@ static int hub_port_wait_reset(struct usb_hub *hub, int port1,
 			 *
 			 * See https://bugzilla.kernel.org/show_bug.cgi?id=41752
 			 */
-			if (hub_port_inactive(hub, portstatus)) {
+			if (hub_port_warm_reset_required(hub, portstatus)) {
 				int ret;
 
 				if ((portchange & USB_PORT_STAT_C_CONNECTION))
@@ -2419,14 +2454,18 @@ int usb_port_suspend(struct usb_device *udev, pm_message_t msg)
 				NULL, 0,
 				USB_CTRL_SET_TIMEOUT);
 
+		/* Try to enable USB2 hardware LPM again */
+		if (udev->usb2_hw_lpm_capable == 1)
+			usb_set_usb2_hardware_lpm(udev, 1);
+
 		/* System sleep transitions should never fail */
 		if (!PMSG_IS_AUTO(msg))
 			status = 0;
 	} else {
 		/* device has up to 10 msec to fully suspend */
-		dev_dbg(&udev->dev, "usb %ssuspend, wakeup %d\n",
+		/*dev_dbg(&udev->dev, "usb %ssuspend, wakeup %d\n",
 				(PMSG_IS_AUTO(msg) ? "auto-" : ""),
-				udev->do_remote_wakeup);
+				udev->do_remote_wakeup);*/
 		usb_set_device_state(udev, USB_STATE_SUSPENDED);
 		msleep(10);
 	}
@@ -2976,7 +3015,9 @@ hub_port_init (struct usb_hub *hub, struct usb_device *udev, int port1,
 				buf->bMaxPacketSize0 = 0;
 				r = usb_control_msg(udev, usb_rcvaddr0pipe(),
 					USB_REQ_GET_DESCRIPTOR, USB_DIR_IN,
-					USB_DT_DEVICE << 8, 0,
+					USB_DT_DEVICE << 8,
+					//USB_DT_DEVICE << 64, // DWC patch suggestion!
+					0,
 					buf, GET_DESCRIPTOR_BUFSIZE,
 					initial_descriptor_timeout);
 				switch (buf->bMaxPacketSize0) {
@@ -3067,6 +3108,22 @@ hub_port_init (struct usb_hub *hub, struct usb_device *udev, int port1,
 	}
 	if (retval)
 		goto fail;
+
+	/*
+	 * Some superspeed devices have finished the link training process
+	 * and attached to a superspeed hub port, but the device descriptor
+	 * got from those devices show they aren't superspeed devices. Warm
+	 * reset the port attached by the devices can fix them.
+	 */
+	if ((udev->speed == USB_SPEED_SUPER) &&
+			(le16_to_cpu(udev->descriptor.bcdUSB) < 0x0300)) {
+		dev_err(&udev->dev, "got a wrong device descriptor, "
+				"warm reset device\n");
+		hub_port_reset(hub, port1, udev,
+				HUB_BH_RESET_TIME, true);
+		retval = -EINVAL;
+		goto fail;
+	}
 
 	if (udev->descriptor.bMaxPacketSize0 == 0xff ||
 			udev->speed == USB_SPEED_SUPER)
@@ -3406,8 +3463,10 @@ loop:
 		release_devnum(udev);
 		hub_free_dev(udev);
 		usb_put_dev(udev);
-		if ((status == -ENOTCONN) || (status == -ENOTSUPP))
-			break;
+		if (status == -ENOTCONN || status == -ENOTSUPP ||
+			status == -ECONNREFUSED)
+			// break; //DWC patch
+			return;
 	}
 	if (hub->hdev->parent ||
 			!hcd->driver->port_handed_over ||
@@ -3625,9 +3684,7 @@ static void hub_events(void)
 			/* Warm reset a USB3 protocol port if it's in
 			 * SS.Inactive state.
 			 */
-			if (hub_is_superspeed(hub->hdev) &&
-				(portstatus & USB_PORT_STAT_LINK_STATE)
-					== USB_SS_PORT_LS_SS_INACTIVE) {
+			if (hub_port_warm_reset_required(hub, portstatus)) {
 				dev_dbg(hub_dev, "warm reset port %d\n", i);
 				hub_port_reset(hub, i, NULL,
 						HUB_BH_RESET_TIME, true);

@@ -1177,6 +1177,7 @@ static int __dev_open(struct net_device *dev)
 		net_dmaengine_get();
 		dev_set_rx_mode(dev);
 		dev_activate(dev);
+		add_device_randomness(dev->dev_addr, dev->addr_len);
 	}
 
 	return ret;
@@ -1421,14 +1422,34 @@ EXPORT_SYMBOL(register_netdevice_notifier);
  *	register_netdevice_notifier(). The notifier is unlinked into the
  *	kernel structures and may then be reused. A negative errno code
  *	is returned on a failure.
+ *
+ * 	After unregistering unregister and down device events are synthesized
+ *	for all devices on the device list to the removed notifier to remove
+ *	the need for special case cleanup code.
  */
 
 int unregister_netdevice_notifier(struct notifier_block *nb)
 {
+	struct net_device *dev;
+	struct net *net;
 	int err;
 
 	rtnl_lock();
 	err = raw_notifier_chain_unregister(&netdev_chain, nb);
+	if (err)
+		goto unlock;
+
+	for_each_net(net) {
+		for_each_netdev(net, dev) {
+			if (dev->flags & IFF_UP) {
+				nb->notifier_call(nb, NETDEV_GOING_DOWN, dev);
+				nb->notifier_call(nb, NETDEV_DOWN, dev);
+			}
+			nb->notifier_call(nb, NETDEV_UNREGISTER, dev);
+			nb->notifier_call(nb, NETDEV_UNREGISTER_BATCH, dev);
+		}
+	}
+unlock:
 	rtnl_unlock();
 	return err;
 }
@@ -1587,10 +1608,14 @@ int dev_forward_skb(struct net_device *dev, struct sk_buff *skb)
 		kfree_skb(skb);
 		return NET_RX_DROP;
 	}
-	skb_set_dev(skb, dev);
+	skb->dev = dev;
+	skb_dst_drop(skb);
 	skb->tstamp.tv64 = 0;
 	skb->pkt_type = PACKET_HOST;
 	skb->protocol = eth_type_trans(skb, dev);
+	skb->mark = 0;
+	secpath_reset(skb);
+	nf_reset(skb);
 	return netif_rx(skb);
 }
 EXPORT_SYMBOL_GPL(dev_forward_skb);
@@ -1845,36 +1870,6 @@ void netif_device_attach(struct net_device *dev)
 }
 EXPORT_SYMBOL(netif_device_attach);
 
-/**
- * skb_dev_set -- assign a new device to a buffer
- * @skb: buffer for the new device
- * @dev: network device
- *
- * If an skb is owned by a device already, we have to reset
- * all data private to the namespace a device belongs to
- * before assigning it a new device.
- */
-#ifdef CONFIG_NET_NS
-void skb_set_dev(struct sk_buff *skb, struct net_device *dev)
-{
-	skb_dst_drop(skb);
-	if (skb->dev && !net_eq(dev_net(skb->dev), dev_net(dev))) {
-		secpath_reset(skb);
-		nf_reset(skb);
-		skb_init_secmark(skb);
-		skb->mark = 0;
-		skb->priority = 0;
-		skb->nf_trace = 0;
-		skb->ipvs_property = 0;
-#ifdef CONFIG_NET_SCHED
-		skb->tc_index = 0;
-#endif
-	}
-	skb->dev = dev;
-}
-EXPORT_SYMBOL(skb_set_dev);
-#endif /* CONFIG_NET_NS */
-
 /*
  * Invalidate hardware checksum when packet is to be mangled, and
  * complete checksum manually on outgoing path.
@@ -2085,25 +2080,6 @@ static int dev_gso_segment(struct sk_buff *skb, int features)
 	return 0;
 }
 
-/*
- * Try to orphan skb early, right before transmission by the device.
- * We cannot orphan skb if tx timestamp is requested or the sk-reference
- * is needed on driver level for other reasons, e.g. see net/can/raw.c
- */
-static inline void skb_orphan_try(struct sk_buff *skb)
-{
-	struct sock *sk = skb->sk;
-
-	if (sk && !skb_shinfo(skb)->tx_flags) {
-		/* skb_tx_hash() wont be able to get sk.
-		 * We copy sk_hash into skb->rxhash
-		 */
-		if (!skb->rxhash)
-			skb->rxhash = sk->sk_hash;
-		skb_orphan(skb);
-	}
-}
-
 static bool can_checksum_protocol(unsigned long features, __be16 protocol)
 {
 	return ((features & NETIF_F_GEN_CSUM) ||
@@ -2187,8 +2163,6 @@ int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
 
 		if (!list_empty(&ptype_all))
 			dev_queue_xmit_nit(skb, dev);
-
-		skb_orphan_try(skb);
 
 		features = netif_skb_features(skb);
 
@@ -2299,7 +2273,7 @@ u16 __skb_tx_hash(const struct net_device *dev, const struct sk_buff *skb,
 	if (skb->sk && skb->sk->sk_hash)
 		hash = skb->sk->sk_hash;
 	else
-		hash = (__force u16) skb->protocol ^ skb->rxhash;
+		hash = (__force u16) skb->protocol;
 	hash = jhash_1word(hash, hashrnd);
 
 	return (u16) (((u64) hash * qcount) >> 32) + qoffset;
@@ -3565,14 +3539,20 @@ static inline gro_result_t
 __napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
 {
 	struct sk_buff *p;
+	unsigned int maclen = skb->dev->hard_header_len;
 
 	for (p = napi->gro_list; p; p = p->next) {
 		unsigned long diffs;
 
 		diffs = (unsigned long)p->dev ^ (unsigned long)skb->dev;
 		diffs |= p->vlan_tci ^ skb->vlan_tci;
-		diffs |= compare_ether_header(skb_mac_header(p),
-					      skb_gro_mac_header(skb));
+		if (maclen == ETH_HLEN)
+			diffs |= compare_ether_header(skb_mac_header(p),
+						      skb_gro_mac_header(skb));
+		else if (!diffs)
+			diffs = memcmp(skb_mac_header(p),
+				       skb_gro_mac_header(skb),
+				       maclen);
 		NAPI_GRO_CB(p)->same_flow = !diffs;
 		NAPI_GRO_CB(p)->flush = 0;
 	}
@@ -3628,7 +3608,8 @@ EXPORT_SYMBOL(napi_gro_receive);
 static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
 {
 	__skb_pull(skb, skb_headlen(skb));
-	skb_reserve(skb, NET_IP_ALIGN - skb_headroom(skb));
+	/* restore the reserve we had after netdev_alloc_skb_ip_align() */
+	skb_reserve(skb, NET_SKB_PAD + NET_IP_ALIGN - skb_headroom(skb));
 	skb->vlan_tci = 0;
 	skb->dev = napi->dev;
 	skb->skb_iif = 0;
@@ -4095,54 +4076,41 @@ static int dev_ifconf(struct net *net, char __user *arg)
 
 #ifdef CONFIG_PROC_FS
 
-#define BUCKET_SPACE (32 - NETDEV_HASHBITS)
-
-struct dev_iter_state {
-	struct seq_net_private p;
-	unsigned int pos; /* bucket << BUCKET_SPACE + offset */
-};
+#define BUCKET_SPACE (32 - NETDEV_HASHBITS - 1)
 
 #define get_bucket(x) ((x) >> BUCKET_SPACE)
 #define get_offset(x) ((x) & ((1 << BUCKET_SPACE) - 1))
 #define set_bucket_offset(b, o) ((b) << BUCKET_SPACE | (o))
 
-static inline struct net_device *dev_from_same_bucket(struct seq_file *seq)
+static inline struct net_device *dev_from_same_bucket(struct seq_file *seq, loff_t *pos)
 {
-	struct dev_iter_state *state = seq->private;
 	struct net *net = seq_file_net(seq);
 	struct net_device *dev;
 	struct hlist_node *p;
 	struct hlist_head *h;
-	unsigned int count, bucket, offset;
+	unsigned int count = 0, offset = get_offset(*pos);
 
-	bucket = get_bucket(state->pos);
-	offset = get_offset(state->pos);
-	h = &net->dev_name_head[bucket];
-	count = 0;
+	h = &net->dev_name_head[get_bucket(*pos)];
 	hlist_for_each_entry_rcu(dev, p, h, name_hlist) {
-		if (count++ == offset) {
-			state->pos = set_bucket_offset(bucket, count);
+		if (++count == offset)
 			return dev;
-		}
 	}
 
 	return NULL;
 }
 
-static inline struct net_device *dev_from_new_bucket(struct seq_file *seq)
+static inline struct net_device *dev_from_bucket(struct seq_file *seq, loff_t *pos)
 {
-	struct dev_iter_state *state = seq->private;
 	struct net_device *dev;
 	unsigned int bucket;
 
-	bucket = get_bucket(state->pos);
 	do {
-		dev = dev_from_same_bucket(seq);
+		dev = dev_from_same_bucket(seq, pos);
 		if (dev)
 			return dev;
 
-		bucket++;
-		state->pos = set_bucket_offset(bucket, 0);
+		bucket = get_bucket(*pos) + 1;
+		*pos = set_bucket_offset(bucket, 1);
 	} while (bucket < NETDEV_HASHENTRIES);
 
 	return NULL;
@@ -4155,33 +4123,20 @@ static inline struct net_device *dev_from_new_bucket(struct seq_file *seq)
 void *dev_seq_start(struct seq_file *seq, loff_t *pos)
 	__acquires(RCU)
 {
-	struct dev_iter_state *state = seq->private;
-
 	rcu_read_lock();
 	if (!*pos)
 		return SEQ_START_TOKEN;
 
-	/* check for end of the hash */
-	if (state->pos == 0 && *pos > 1)
+	if (get_bucket(*pos) >= NETDEV_HASHENTRIES)
 		return NULL;
 
-	return dev_from_new_bucket(seq);
+	return dev_from_bucket(seq, pos);
 }
 
 void *dev_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 {
-	struct net_device *dev;
-
 	++*pos;
-
-	if (v == SEQ_START_TOKEN)
-		return dev_from_new_bucket(seq);
-
-	dev = dev_from_same_bucket(seq);
-	if (dev)
-		return dev;
-
-	return dev_from_new_bucket(seq);
+	return dev_from_bucket(seq, pos);
 }
 
 void dev_seq_stop(struct seq_file *seq, void *v)
@@ -4280,13 +4235,7 @@ static const struct seq_operations dev_seq_ops = {
 static int dev_seq_open(struct inode *inode, struct file *file)
 {
 	return seq_open_net(inode, file, &dev_seq_ops,
-			    sizeof(struct dev_iter_state));
-}
-
-int dev_seq_open_ops(struct inode *inode, struct file *file,
-		     const struct seq_operations *ops)
-{
-	return seq_open_net(inode, file, ops, sizeof(struct dev_iter_state));
+			    sizeof(struct seq_net_private));
 }
 
 static const struct file_operations dev_seq_fops = {
@@ -4893,6 +4842,7 @@ int dev_set_mac_address(struct net_device *dev, struct sockaddr *sa)
 	err = ops->ndo_set_mac_address(dev, sa);
 	if (!err)
 		call_netdevice_notifiers(NETDEV_CHANGEADDR, dev);
+	add_device_randomness(dev->dev_addr, dev->addr_len);
 	return err;
 }
 EXPORT_SYMBOL(dev_set_mac_address);
@@ -5673,6 +5623,7 @@ int register_netdevice(struct net_device *dev)
 	dev_init_scheduler(dev);
 	dev_hold(dev);
 	list_netdevice(dev);
+	add_device_randomness(dev->dev_addr, dev->addr_len);
 
 	/* Notify protocols, that a new device appeared. */
 	ret = call_netdevice_notifiers(NETDEV_REGISTER, dev);
